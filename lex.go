@@ -143,7 +143,7 @@ func (l *lexer) ignore() {
 
 // accept consumes the next rune if it's from the valid set.
 func (l *lexer) accept(valid string) bool {
-	if strings.IndexRune(valid, l.next()) >= 0 {
+	if strings.ContainsRune(valid, l.next()) {
 		return true
 	}
 	l.backup()
@@ -152,7 +152,7 @@ func (l *lexer) accept(valid string) bool {
 
 // acceptRun consumes a run of runes from the valid set.
 func (l *lexer) acceptRun(valid string) {
-	for strings.IndexRune(valid, l.next()) >= 0 {
+	for strings.ContainsRune(valid, l.next()) {
 	}
 	l.backup()
 }
@@ -173,13 +173,16 @@ func (l *lexer) errorf(format string, args ...interface{}) stateFn {
 }
 
 func (l *lexer) unexpectedEOF() stateFn {
-	l.items <- item{itemError, "unexpected EOF"}
 	return nil
 }
 
 // nextItem returns the next item from the input.
 func (l *lexer) nextItem() item {
-	return <-l.items
+	r, more := <-l.items
+	if !more {
+		return item{itemError, "unexpected EOF"}
+	}
+	return r
 }
 
 // lex initializes and runs a new scanner for the input string.
@@ -189,7 +192,7 @@ func lex(input string) (*lexer, error) {
 	}
 	l := &lexer{
 		input: input,
-		items: make(chan item),
+		items: make(chan item, 0x1000),
 	}
 	go l.run()
 	return l, nil
@@ -200,6 +203,15 @@ func lex(input string) (*lexer, error) {
 func (l *lexer) run() {
 	for l.state = lexRule; l.state != nil; {
 		l.state = l.state(l)
+	}
+	close(l.items)
+}
+
+func (l *lexer) close() {
+	// Reads all items until channel close to be sure goroutine has ended.
+	more := true
+	for more {
+		_, more = <-l.items
 	}
 }
 
@@ -221,9 +233,21 @@ func lexRule(l *lexer) stateFn {
 
 // lexComment consumes a commented rule.
 func lexComment(l *lexer) stateFn {
+	// Ignore leading spaces and #.
+	l.ignore()
+	for {
+		r := l.next()
+		if unicode.IsSpace(r) || r == '#' {
+			l.ignore()
+		} else {
+			break
+		}
+	}
+	l.backup()
+
 	for {
 		switch l.next() {
-		case '\n':
+		case '\r', '\n':
 			l.emit(itemComment, false)
 			return lexRule
 		case eof:
@@ -257,7 +281,7 @@ func lexProtocol(l *lexer) stateFn {
 		case r == ' ':
 			l.emit(itemProtocol, true)
 			return lexSourceAddress
-		case !(unicode.IsLetter(r) || (l.len() > 0 && r == '-')):
+		case !(unicode.IsLetter(r) || unicode.IsDigit(r) || (l.len() > 0 && r == '-')):
 			return l.errorf("invalid character %q for a rule protocol", r)
 		}
 	}
@@ -418,8 +442,6 @@ func lexOptionValue(l *lexer) stateFn {
 
 // lexOptionEnd marks the end of a rule.
 func lexRuleEnd(l *lexer) stateFn {
-	l.acceptRun(" \t;")
-	l.ignore()
 	l.emit(itemEOR, false)
 	return lexRule
 }

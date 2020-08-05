@@ -41,6 +41,13 @@ var metaSplitRE = regexp.MustCompile(`,\s*`)
 // encoded content.
 func parseContent(content string) ([]byte, error) {
 	// Decode and replace all occurrences of hexadecimal content.
+	var errpanic error
+	defer func() {
+		r := recover()
+		if r != nil {
+			errpanic = fmt.Errorf("recovered from panic: %v", r)
+		}
+	}()
 	b := hexRE.ReplaceAllStringFunc(content,
 		func(h string) string {
 			r, err := hex.DecodeString(strings.Replace(strings.Trim(h, "|"), " ", "", -1))
@@ -49,7 +56,7 @@ func parseContent(content string) ([]byte, error) {
 			}
 			return string(r)
 		})
-	return []byte(b), nil
+	return []byte(b), errpanic
 }
 
 // parsePCRE parses the components of a PCRE. Returns PCRE struct.
@@ -75,6 +82,242 @@ func parsePCRE(s string) (*PCRE, error) {
 	}, nil
 }
 
+// parseLenMatch parses a LenMatch (like urilen).
+func parseLenMatch(k lenMatchType, s string) (*LenMatch, error) {
+	m := new(LenMatch)
+	m.Kind = k
+	switch {
+	// Simple case, no operators.
+	case !strings.ContainsAny(s, "><"):
+		// Ignore options after ','.
+		numTmp := strings.Split(s, ",")[0]
+		num, err := strconv.Atoi(strings.TrimSpace(numTmp))
+		if err != nil {
+			return nil, fmt.Errorf("%v is not an integer", s)
+		}
+		m.Num = num
+
+	// Leading operator, single number.
+	case strings.HasPrefix(s, ">") || strings.HasPrefix(s, "<"):
+		m.Operator = s[0:1]
+		// Strip leading < or >.
+		numTmp := strings.TrimLeft(s, "><")
+		// Ignore options after ','.
+		numTmp = strings.Split(numTmp, ",")[0]
+		num, err := strconv.Atoi(strings.TrimSpace(numTmp))
+		if err != nil {
+			return nil, fmt.Errorf("%v is not an integer", s)
+		}
+		m.Num = num
+
+	// Min/Max center operator.
+	case strings.Contains(s, "<>"):
+		m.Operator = "<>"
+		parts := strings.Split(s, "<>")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("must have exactly 2 parts for min/max operator. got %d", len(parts))
+		}
+		var min, max int
+		var err error
+		min, err = strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("%v is not an integer", strings.TrimSpace(parts[0]))
+		}
+		maxTmp := strings.Split(parts[1], ",")[0]
+		max, err = strconv.Atoi(strings.TrimSpace(maxTmp))
+		if err != nil {
+			return nil, fmt.Errorf("%v is not an integer", strings.TrimSpace(maxTmp))
+		}
+		// Do stuff to handle options here.
+		m.Min = min
+		m.Max = max
+	}
+
+	// Parse options:
+	if strings.Contains(s, ",") {
+		opts := strings.Split(s, ",")[1:]
+		for i, o := range opts {
+			opts[i] = strings.TrimSpace(o)
+		}
+		m.Options = opts
+	}
+	return m, nil
+}
+
+func parseBase64Decode(k byteMatchType, s string) (*ByteMatch, error) {
+	if k != b64Decode {
+		return nil, fmt.Errorf("kind %v is not base64_decode", k)
+	}
+	b := new(ByteMatch)
+	b.Kind = k
+
+	// All options to base64_decode are optional, and specified by their keyword.
+	for _, p := range strings.Split(s, ",") {
+		v := strings.TrimSpace(p)
+		switch {
+		case strings.HasPrefix(v, "bytes"):
+			b.NumBytes = strings.TrimSpace(strings.SplitAfter(v, "bytes")[1])
+		case strings.HasPrefix(v, "offset"):
+			val := strings.TrimSpace(strings.SplitAfter(v, "offset")[1])
+			i, err := strconv.Atoi(val)
+			if err != nil {
+				return nil, fmt.Errorf("offset is not an int: %s; %s", val, err)
+			}
+			if i < 1 {
+				return nil, fmt.Errorf("offset must be positive, non-zero values only")
+			}
+			b.Offset = i
+		case strings.HasPrefix(v, "relative"):
+			b.Options = []string{"relative"}
+		}
+	}
+	return b, nil
+}
+
+// parseByteMatch parses a ByteMatch.
+func parseByteMatch(k byteMatchType, s string) (*ByteMatch, error) {
+	b := new(ByteMatch)
+	b.Kind = k
+
+	parts := strings.Split(s, ",")
+
+	// Num bytes is required for all byteMatchType keywords.
+	if len(parts) < 1 {
+		return nil, fmt.Errorf("%s keyword has %d parts", s, len(parts))
+	}
+
+	b.NumBytes = strings.TrimSpace(parts[0])
+
+	if len(parts) < b.Kind.minLen() {
+		return nil, fmt.Errorf("invalid %s length: %d", b.Kind, len(parts))
+	}
+
+	if k == bExtract || k == bJump {
+		// Parse offset.
+		offset, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return nil, fmt.Errorf("%s offset is not an int: %v; %s", b.Kind, parts[1], err)
+		}
+		b.Offset = offset
+	}
+
+	if k == bExtract {
+		// Parse variable name.
+		name := parts[2]
+		b.Variable = name
+	}
+
+	if k == bTest {
+		// Parse operator.
+		b.Operator = strings.TrimSpace(parts[1])
+		// Parse value. Can use a variable.
+		b.Value = strings.TrimSpace(parts[2])
+		// Parse offset.
+		offset, err := strconv.Atoi(strings.TrimSpace(parts[3]))
+		if err != nil {
+			return nil, fmt.Errorf("%s offset is not an int: %v; %s", b.Kind, parts[1], err)
+		}
+		b.Offset = offset
+	}
+
+	// The rest of the options, for all types not b64decode
+	for i, l := b.Kind.minLen(), len(parts); i < l; i++ {
+		parts[i] = strings.TrimSpace(parts[i])
+		b.Options = append(b.Options, parts[i])
+	}
+
+	return b, nil
+}
+
+// parseFlowbit parses a flowbit.
+func parseFlowbit(s string) (*Flowbit, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) < 1 {
+		return nil, fmt.Errorf("couldn't parse flowbit string: %s", s)
+	}
+	// Ensure all actions are of valid type.
+	a := strings.TrimSpace(parts[0])
+	if !inSlice(a, []string{"noalert", "isset", "isnotset", "set", "unset", "toggle"}) {
+		return nil, fmt.Errorf("invalid action for flowbit: %s", a)
+	}
+	fb := &Flowbit{
+		Action: a,
+	}
+	if fb.Action == "noalert" && len(parts) > 1 {
+		return nil, fmt.Errorf("noalert shouldn't have a value")
+	}
+	if len(parts) == 2 {
+		fb.Value = strings.TrimSpace(parts[1])
+	}
+	return fb, nil
+}
+
+// parseXbit parses an xbit.
+func parseXbit(s string) (*Xbit, error) {
+	parts := strings.Split(s, ",")
+	// All xbits must have an action, name and track
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("not enough parts for xbits: %s", s)
+	}
+	// Ensure all actions are of valid type.
+	a := strings.TrimSpace(parts[0])
+	if !inSlice(a, []string{"set", "unset", "isset", "isnotset", "toggle"}) {
+		return nil, fmt.Errorf("invalid action for xbits: %s", a)
+	}
+	xb := &Xbit{
+		Action: a,
+		Name:   strings.TrimSpace(parts[1]),
+	}
+
+	// Track.
+	t := strings.Fields(parts[2])
+	if len(t) != 2 {
+		return nil, fmt.Errorf("wrong number of parts for track: %v", t)
+	}
+	if t[0] != "track" {
+		return nil, fmt.Errorf("%s should be 'track'", t[0])
+	}
+	xb.Track = t[1]
+
+	// Expire
+	if len(parts) == 4 {
+		e := strings.Fields(parts[3])
+		if len(e) != 2 {
+			return nil, fmt.Errorf("wrong number of parts for expire: %v", e)
+		}
+		if e[0] != "expire" {
+			return nil, fmt.Errorf("%s should be 'expire'", e[0])
+		}
+		xb.Expire = e[1]
+	}
+	return xb, nil
+
+}
+
+// parseFlowint parses a flowint.
+func parseFlowint(s string) (*Flowint, error) {
+	parts := strings.Split(s, ",")
+	// All flowints must have a name and modifier
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("not enough parts for flowint: %s", s)
+	}
+	// Ensure all actions are of valid type.
+	m := strings.TrimSpace(parts[1])
+	if !inSlice(m, []string{"+", "-", "=", ">", "<", ">=", "<=", "==", "!=", "isset", "isnotset"}) {
+		return nil, fmt.Errorf("invalid modifier for flowint: %s", m)
+	}
+	fi := &Flowint{
+		Name:     strings.TrimSpace(parts[0]),
+		Modifier: m,
+	}
+
+	if len(parts) == 3 {
+		fi.Value = strings.TrimSpace(parts[2])
+	}
+
+	return fi, nil
+}
+
 func unquote(s string) string {
 	if strings.IndexByte(s, '"') < 0 {
 		return s
@@ -96,8 +339,11 @@ func (r *Rule) comment(key item, l *lexer) error {
 	if key.typ != itemComment {
 		panic("item is not a comment")
 	}
-	// Pop off all leading # and space, try to parse as rule
-	rule, err := ParseRule(strings.TrimLeft(key.value, "# "))
+	if r.Disabled {
+		// ignoring comment for rule with empty action
+		return nil
+	}
+	rule, err := parseRuleAux(key.value, true)
 
 	// If there was an error this means the comment is not a rule.
 	if err != nil {
@@ -130,12 +376,15 @@ func (r *Rule) protocol(key item, l *lexer) error {
 	return nil
 }
 
-// netSplitRE matches the characters to split a list of networks [$HOME_NET, 192.168.1.1/32] for example.
-var netSplitRE = regexp.MustCompile(`\s*,\s*`)
-
 // network decodes an IDS rule network (networks and ports) based on its key.
 func (r *Rule) network(key item, l *lexer) error {
-	items := netSplitRE.Split(strings.Trim(key.value, "[]"), -1)
+	items := strings.Split(strings.Trim(key.value, "[]"), ",")
+	// Validate that no items contain spaces.
+	for _, i := range items {
+		if len(strings.Fields(i)) > 1 || len(strings.TrimSpace(i)) != len(i) {
+			return fmt.Errorf("network component contains spaces: %v", i)
+		}
+	}
 	switch key.typ {
 	case itemSourceAddress:
 		r.Source.Nets = append(r.Source.Nets, items...)
@@ -175,7 +424,13 @@ func (r *Rule) option(key item, l *lexer) error {
 		panic("item is not an option key")
 	}
 	switch {
-	case inSlice(key.value, []string{"classtype", "flow", "threshold", "tag", "priority", "dsize", "byte_test"}):
+	// TODO: Many of these simple tags could be factored into nicer structures.
+	case inSlice(key.value, []string{"classtype", "flow", "tag", "priority", "app-layer-protocol", "noalert",
+		"flags", "ipopts", "ip_proto", "geoip", "fragbits", "fragoffset", "tos",
+		"window",
+		"threshold", "detection_filter",
+		"dce_iface", "dce_opnum", "dce_stub_data",
+		"asn1"}):
 		nextItem := l.nextItem()
 		if nextItem.typ != itemOptionValue {
 			return fmt.Errorf("no valid value for %s tag", key.value)
@@ -184,6 +439,34 @@ func (r *Rule) option(key item, l *lexer) error {
 			r.Tags = make(map[string]string)
 		}
 		r.Tags[key.value] = nextItem.value
+	case inSlice(key.value, []string{"sameip", "tls.store", "ftpbounce"}):
+		r.Statements = append(r.Statements, key.value)
+	case inSlice(key.value, tlsTags):
+		t := &TLSTag{
+			Key: key.value,
+		}
+		nextItem := l.nextItem()
+		if nextItem.typ == itemNot {
+			t.Negate = true
+			nextItem = l.nextItem()
+		}
+		t.Value = nextItem.value
+		r.TLSTags = append(r.TLSTags, t)
+	case key.value == "stream_size":
+		nextItem := l.nextItem()
+		parts := strings.Split(nextItem.value, ",")
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid number of parts for stream_size: %d", len(parts))
+		}
+		num, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil {
+			return fmt.Errorf("comparison number is not an integer: %v", parts[2])
+		}
+		r.StreamMatch = &StreamCmp{
+			Direction: parts[0],
+			Operator:  parts[1],
+			Number:    num,
+		}
 	case key.value == "reference":
 		nextItem := l.nextItem()
 		if nextItem.typ != itemOptionValue {
@@ -262,21 +545,21 @@ func (r *Rule) option(key item, l *lexer) error {
 				Negate:       negate,
 				Options:      options,
 			}
-			r.Contents = append(r.Contents, con)
 			r.Matchers = append(r.Matchers, con)
 		} else {
 			return fmt.Errorf("invalid type %q for option content", nextItem.typ)
 		}
 	case inSlice(key.value, []string{"http_cookie", "http_raw_cookie", "http_method", "http_header", "http_raw_header",
 		"http_uri", "http_raw_uri", "http_user_agent", "http_stat_code", "http_stat_msg",
-		"http_client_body", "http_server_body", "nocase"}):
-		if len(r.Contents) == 0 {
+		"http_client_body", "http_server_body", "http_host", "nocase", "rawbytes", "startswith", "endswith"}):
+		lastContent := r.LastContent()
+		if lastContent == nil {
 			return fmt.Errorf("invalid content option %q with no content match", key.value)
 		}
-		lastContent := r.Contents[len(r.Contents)-1]
 		lastContent.Options = append(lastContent.Options, &ContentOption{Name: key.value})
 	case inSlice(key.value, []string{"depth", "distance", "offset", "within"}):
-		if len(r.Contents) == 0 {
+		lastContent := r.LastContent()
+		if lastContent == nil {
 			return fmt.Errorf("invalid content option %q with no content match", key.value)
 		}
 		nextItem := l.nextItem()
@@ -284,18 +567,11 @@ func (r *Rule) option(key item, l *lexer) error {
 			return fmt.Errorf("no value for content option %s", key.value)
 		}
 
-		// check if the value is an integer value
-		if _, err := strconv.Atoi(nextItem.value); err != nil {
-			// check if it is the name of a var
-			if _, ok := r.Vars[nextItem.value]; !ok {
-				return fmt.Errorf("invalid value %s for option %s", nextItem.value, key.value)
-			}
-		}
-		lastContent := r.Contents[len(r.Contents)-1]
 		lastContent.Options = append(lastContent.Options, &ContentOption{Name: key.value, Value: nextItem.value})
 
 	case key.value == "fast_pattern":
-		if len(r.Contents) == 0 {
+		lastContent := r.LastContent()
+		if lastContent == nil {
 			return fmt.Errorf("invalid content option %q with no content match", key.value)
 		}
 		var (
@@ -323,7 +599,6 @@ func (r *Rule) option(key item, l *lexer) error {
 				length = i
 			}
 		}
-		lastContent := r.Contents[len(r.Contents)-1]
 		lastContent.FastPattern = FastPattern{true, only, offset, length}
 	case key.value == "pcre":
 		nextItem := l.nextItem()
@@ -338,84 +613,125 @@ func (r *Rule) option(key item, l *lexer) error {
 				return err
 			}
 			p.Negate = negate
-			r.PCREs = append(r.PCREs, p)
 			r.Matchers = append(r.Matchers, p)
 		} else {
 			return fmt.Errorf("invalid type %q for option content", nextItem.typ)
 		}
-	case key.value == "byte_extract":
-		if len(r.Contents) == 0 {
-			return fmt.Errorf("invalid content option %q with no content match", key.value)
+	case inSlice(key.value, allbyteMatchTypeNames()):
+		k, err := byteMatcher(key.value)
+		if err != nil {
+			return fmt.Errorf("%s is not a supported byteMatchType keyword", key.value)
+		}
+
+		// Handle negation logic here, don't want to pass lexer to parseByteMatch.
+		nextItem := l.nextItem()
+		var negate bool
+		if k == isDataAt && nextItem.typ == itemNot {
+			negate = true
+			nextItem = l.nextItem()
+		}
+
+		var b *ByteMatch
+		// Parse base64_decode differently as it has odd semantics.
+		if k == b64Decode {
+			b, err = parseBase64Decode(k, nextItem.value)
+			if err != nil {
+				return fmt.Errorf("could not parse base64Decode: %v", err)
+			}
+			// base64_decode allows NumBytes to be empty, an int or a variable.
+			if i, err := strconv.Atoi(b.NumBytes); err != nil && b.NumBytes != "" {
+				// NumBytes is not an int, check if it is a variable from byte_extract.
+				if !r.HasVar(b.NumBytes) {
+					return fmt.Errorf("number of bytes is not an int, or an extracted variable: %s; %s", b.NumBytes, err)
+				} else if i < 1 {
+					return fmt.Errorf("bytes must be positive, non-zero values only: %d", i)
+				}
+			}
+		} else {
+			b, err = parseByteMatch(k, nextItem.value)
+			if err != nil {
+				return fmt.Errorf("could not parse byteMatch: %v", err)
+			}
+			if _, err := strconv.Atoi(b.NumBytes); err != nil {
+				// NumBytes is not an int, check if it is a variable from byte_extract.
+				if !r.HasVar(b.NumBytes) {
+					return fmt.Errorf("number of bytes is not an int, or an extracted variable: %s; %s", b.NumBytes, err)
+				}
+			}
+		}
+		b.Negate = negate
+
+		r.Matchers = append(r.Matchers, b)
+	case inSlice(key.value, allLenMatchTypeNames()):
+		k, err := lenMatcher(key.value)
+		if err != nil {
+			return fmt.Errorf("%s is not a support lenMatch keyword", key.value)
 		}
 		nextItem := l.nextItem()
-		parts := strings.Split(nextItem.value, ",")
-		if len(parts) < 3 {
-			return fmt.Errorf("invalid byte_extract value: %s", nextItem.value)
-		}
-
-		v := new(Var)
-
-		n, err := strconv.Atoi(parts[0])
+		m, err := parseLenMatch(k, nextItem.value)
 		if err != nil {
-			return fmt.Errorf("byte_extract number of bytes is not an int: %s; %s", parts[0], err)
+			return fmt.Errorf("could not parse LenMatch: %v", err)
 		}
-		v.NumBytes = n
-
-		offset, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return fmt.Errorf("byte_extract offset is not an int: %s; %s", parts[1], err)
-		}
-		v.Offset = offset
-
-		name := parts[2]
-		if r.Vars == nil {
-			// Lazy init r.Vars if necessary
-			r.Vars = make(map[string]*Var)
-		} else if _, exists := r.Vars[name]; exists {
-			return fmt.Errorf("byte_extract var already declared: %s", name)
-		}
-
-		// options
-		for i, l := 3, len(parts); i < l; i++ {
-			parts[i] = strings.TrimSpace(parts[i])
-			v.Options = append(v.Options, parts[i])
-		}
-
-		r.Vars[name] = v
-		lastContent := r.Contents[len(r.Contents)-1]
-		lastContent.Options = append(lastContent.Options, &ContentOption{Name: key.value, Value: strings.Join(parts, ",")})
+		m.DataPosition = dataPosition
+		r.Matchers = append(r.Matchers, m)
 	case key.value == "flowbits":
 		nextItem := l.nextItem()
-		parts := strings.Split(nextItem.value, ",")
-		if len(parts) < 1 {
-			return fmt.Errorf("couldn't parse flowbit string: %s", nextItem.value)
-		}
-		// Ensure all actions are of valid type.
-		if !inSlice(parts[0], []string{"noalert", "isset", "isnotset", "set", "unset", "toggle"}) {
-			return fmt.Errorf("invalid action for flowbit: %s", parts[0])
-		}
-		fb := &Flowbit{
-			Action: strings.TrimSpace(parts[0]),
-		}
-		if len(parts) == 2 {
-			fb.Value = strings.TrimSpace(parts[1])
+		fb, err := parseFlowbit(nextItem.value)
+		if err != nil {
+			return fmt.Errorf("error parsing flowbit: %v", err)
 		}
 		r.Flowbits = append(r.Flowbits, fb)
+	case key.value == "xbits":
+		nextItem := l.nextItem()
+		xb, err := parseXbit(nextItem.value)
+		if err != nil {
+			return fmt.Errorf("error parsing xbits: %v", err)
+		}
+		r.Xbits = append(r.Xbits, xb)
+	case key.value == "flowint":
+		nextItem := l.nextItem()
+		fi, err := parseFlowint(nextItem.value)
+		if err != nil {
+			return fmt.Errorf("error parsing flowint: %v", err)
+		}
+		r.Flowints = append(r.Flowints, fi)
+	default:
+		return &UnsupportedOptionError{
+			Options: []string{key.value},
+		}
 	}
 	return nil
 }
 
-// ParseRule parses an IDS rule and returns a struct describing the rule.
-func ParseRule(rule string) (*Rule, error) {
+// UnsupportedOptionError contains a partially parsed rule, and the options that aren't
+// supported for parsing.
+type UnsupportedOptionError struct {
+	Rule    *Rule
+	Options []string
+}
+
+// Error returns a string for UnsupportedOptionError
+func (uoe *UnsupportedOptionError) Error() string {
+	return fmt.Sprintf("rule contains unsupported option(s): %s", strings.Join(uoe.Options, ","))
+}
+
+// parseRuleAux parses an IDS rule, optionally ignoring comments.
+func parseRuleAux(rule string, commented bool) (*Rule, error) {
 	l, err := lex(rule)
 	if err != nil {
 		return nil, err
 	}
+	defer l.close()
 	dataPosition = pktData
 	r := &Rule{}
+	var unsupportedOptions = make([]string, 0, 3)
 	for item := l.nextItem(); item.typ != itemEOR && item.typ != itemEOF && err == nil; item = l.nextItem() {
 		switch item.typ {
 		case itemComment:
+			if r.Action != "" || commented {
+				// Ignore comment ending rule.
+				return r, nil
+			}
 			err = r.comment(item, l)
 			// Error here means that the comment was not a commented rule.
 			// So we're not parsing a rule and we need to break out.
@@ -434,12 +750,33 @@ func ParseRule(rule string) (*Rule, error) {
 			err = r.direction(item, l)
 		case itemOptionKey:
 			err = r.option(item, l)
+			// We will continue to parse a rule with unsupported options.
+			if uerr, ok := err.(*UnsupportedOptionError); ok {
+				unsupportedOptions = append(unsupportedOptions, uerr.Options...)
+				// This is ugly but allows the parsing to continue.
+				err = nil
+			}
 		case itemError:
 			err = errors.New(item.value)
 		}
+		// Unrecoverable parse error.
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	// If we encountered one or more unsupported keys, return an UnsupportedOptionError.
+	if len(unsupportedOptions) > 0 {
+		return nil, &UnsupportedOptionError{
+			Rule:    r,
+			Options: unsupportedOptions,
+		}
+	}
+
 	return r, nil
+}
+
+// ParseRule parses an IDS rule and returns a struct describing the rule.
+func ParseRule(rule string) (*Rule, error) {
+	return parseRuleAux(rule, false)
 }
